@@ -1,19 +1,129 @@
 """train.py — the loop that makes the model less wrong.
 
-The training loop is plumbing, but it's the plumbing that turns a randomly
-initialized network into a language model:
+Usage:  python train.py [preset]      # preset defaults to "medium"
 
-    for each step:
-        x, y = get_batch('train')     # fetch a batch
-        logits, loss = model(x, y)    # forward pass + cross-entropy loss
-        loss.backward()               # backprop: how should each knob change?
-        optimizer.step()              # nudge every knob a little
-        optimizer.zero_grad()         # reset for next step
-
-We print train/val loss periodically to watch it learn. The rule of thumb:
-start tiny and prove the wiring overfits a small slice before scaling up.
-
-Phase 4 fills this in. For now it is a scaffold describing the plan.
+The loop itself is five lines (fetch batch -> forward+loss -> zero grads ->
+backward -> step). Everything else is measurement and bookkeeping: we print
+train/val loss periodically and save checkpoints (including milestone
+snapshots so we can later show the gibberish -> text progression).
 """
 
-# TODO(Phase 4): config, model init, Adam optimizer, training loop, eval
+import os
+import sys
+import time
+
+import torch
+
+import data
+from model import GPT, GPTConfig
+
+# Model + training knobs, grouped as presets. Start small to prove the wiring
+# learns, then scale up for better text — exactly the guide's advice.
+PRESETS = {
+    "tiny":   dict(n_layer=2, n_head=2, n_embd=64,  block_size=32,  batch_size=16, max_iters=1000, lr=1e-3),
+    "small":  dict(n_layer=4, n_head=4, n_embd=128, block_size=64,  batch_size=32, max_iters=3000, lr=1e-3),
+    "medium": dict(n_layer=6, n_head=6, n_embd=192, block_size=128, batch_size=64, max_iters=5000, lr=3e-4),
+    "big":    dict(n_layer=6, n_head=6, n_embd=384, block_size=256, batch_size=64, max_iters=3600, lr=3e-4),
+}
+
+EVAL_INTERVAL = 250   # how often to measure train/val loss
+EVAL_ITERS = 50       # batches averaged per loss estimate
+SEED = 1337
+
+
+def pick_device() -> str:
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+@torch.no_grad()
+def estimate_loss(model, ds, block_size, batch_size, device):
+    """Average loss over several batches of train AND val (no grad, eval mode).
+
+    Averaging smooths out the noise of any single random batch, and the
+    train-vs-val gap is our overfitting gauge.
+    """
+    model.eval()
+    out = {}
+    for split, d in (("train", ds.train_data), ("val", ds.val_data)):
+        losses = torch.zeros(EVAL_ITERS)
+        for k in range(EVAL_ITERS):
+            x, y = data.get_batch(d, block_size, batch_size, device)
+            _, loss = model(x, y)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+
+def save_ckpt(path, model, cfg, ds, history, preset):
+    """Save everything sample.py needs to regenerate text without the corpus."""
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": cfg,
+            "stoi": ds.stoi,
+            "itos": ds.itos,
+            "history": history,
+            "preset": preset,
+        },
+        path,
+    )
+
+
+def main():
+    preset_name = sys.argv[1] if len(sys.argv) > 1 else "medium"
+    p = PRESETS[preset_name]
+    device = os.environ.get("DEVICE") or pick_device()
+    torch.manual_seed(SEED)
+
+    ds = data.load()
+    cfg = GPTConfig(
+        vocab_size=ds.vocab_size,
+        block_size=p["block_size"],
+        n_embd=p["n_embd"],
+        n_head=p["n_head"],
+        n_layer=p["n_layer"],
+    )
+    model = GPT(cfg).to(device)
+    print(f"preset={preset_name}  device={device}  params={model.num_params():,}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=p["lr"])
+
+    # Milestone snapshots for the README's gibberish -> text story.
+    milestones = sorted({0, p["max_iters"] // 4, p["max_iters"] // 2, p["max_iters"]})
+
+    history = []
+    t0 = time.time()
+    for it in range(p["max_iters"] + 1):
+        if it % EVAL_INTERVAL == 0 or it == p["max_iters"]:
+            losses = estimate_loss(model, ds, p["block_size"], p["batch_size"], device)
+            history.append((it, losses["train"], losses["val"]))
+            print(
+                f"step {it:5d} | train {losses['train']:.4f} | "
+                f"val {losses['val']:.4f} | {time.time() - t0:.0f}s"
+            )
+
+        if it in milestones:
+            os.makedirs("checkpoints", exist_ok=True)
+            save_ckpt(f"checkpoints/ckpt_{it}.pt", model, cfg, ds, history, preset_name)
+
+        if it == p["max_iters"]:
+            break
+
+        # ---- the five lines that do all the learning ----
+        x, y = data.get_batch(ds.train_data, p["block_size"], p["batch_size"], device)
+        _, loss = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    save_ckpt("ckpt.pt", model, cfg, ds, history, preset_name)
+    print(f"done in {time.time() - t0:.0f}s — saved ckpt.pt and {len(milestones)} milestones")
+
+
+if __name__ == "__main__":
+    main()
