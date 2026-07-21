@@ -10,6 +10,7 @@ input.txt
 *.pt
 *.pth
 *.ckpt
+history.json
 
 # OS
 .DS_Store

@@ -7,6 +7,11 @@ This is the heart of the project. Built smallest-to-largest:
     Block (attention + FFN, with residuals + LayerNorm)  <- Phase 3
     GPT (embeddings -> N blocks -> output head + loss)   <- Phase 3
 
+Dropout was added after the first big training run overfit hard (train loss
+0.32 while val loss climbed to 2.84): it randomly zeros activations during
+training so the model can't rely on memorized specifics. It defaults to 0.0,
+so the Phase 2/3 sanity checks below stay deterministic.
+
 The one rule: attention is written by hand, not imported from
 nn.MultiheadAttention. Understanding it is the whole point.
 """
@@ -30,13 +35,14 @@ class Head(nn.Module):
     Output shape: (B, T, head_size).
     """
 
-    def __init__(self, n_embd: int, head_size: int, block_size: int):
+    def __init__(self, n_embd: int, head_size: int, block_size: int, dropout: float = 0.0):
         super().__init__()
         # No bias: LayerNorm/embeddings already handle offsets, and Q/K/V are
         # conventionally bias-free. These are the only learned parts of a head.
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
         # A lower-triangular matrix of 1s. tril[i, j] == 1 iff j <= i, i.e.
         # position i is allowed to attend to position j. It's a CONSTANT (not
@@ -49,6 +55,7 @@ class Head(nn.Module):
 
         Factored out of forward() so the sanity check can inspect the exact
         weights the model uses — no duplicated logic to drift out of sync.
+        (Dropout is applied in forward, not here, so this stays clean.)
         """
         B, T, C = x.shape
         k = self.key(x)                                  # (B, T, head_size)
@@ -67,6 +74,7 @@ class Head(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         wei = self._weights(x)                           # (B, T, T)
+        wei = self.dropout(wei)                          # drop some attention links
         v = self.value(x)                                # (B, T, head_size)
         return wei @ v                                   # (B, T, head_size)
 
@@ -80,19 +88,20 @@ class MultiHeadAttention(nn.Module):
     final linear projection to let the heads' outputs mix.
     """
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0):
         super().__init__()
         assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
         head_size = n_embd // n_head
         self.heads = nn.ModuleList(
-            [Head(n_embd, head_size, block_size) for _ in range(n_head)]
+            [Head(n_embd, head_size, block_size, dropout) for _ in range(n_head)]
         )
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Concatenate along the feature dim: n_head * head_size == n_embd.
         out = torch.cat([h(x) for h in self.heads], dim=-1)   # (B, T, n_embd)
-        return self.proj(out)                                 # (B, T, n_embd)
+        return self.dropout(self.proj(out))                   # (B, T, n_embd)
 
 
 class FeedForward(nn.Module):
@@ -102,12 +111,13 @@ class FeedForward(nn.Module):
     attention's job). The 4x hidden width is the standard transformer ratio.
     """
 
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -126,12 +136,12 @@ class Block(nn.Module):
     is the modern, more-stable convention.
     """
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head, block_size)
+        self.attn = MultiHeadAttention(n_embd, n_head, block_size, dropout)
         self.ln2 = nn.LayerNorm(n_embd)
-        self.ffn = FeedForward(n_embd)
+        self.ffn = FeedForward(n_embd, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x))
@@ -148,6 +158,7 @@ class GPTConfig:
     n_embd: int = 64         # embedding / residual-stream width
     n_head: int = 4          # attention heads per block
     n_layer: int = 4         # number of transformer blocks stacked
+    dropout: float = 0.0     # regularization; 0.0 keeps sanity checks exact
 
 
 class GPT(nn.Module):
@@ -164,9 +175,10 @@ class GPT(nn.Module):
         # "what character am I" and "where in the sequence am I", both learned.
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.Sequential(
             *[
-                Block(config.n_embd, config.n_head, config.block_size)
+                Block(config.n_embd, config.n_head, config.block_size, config.dropout)
                 for _ in range(config.n_layer)
             ]
         )
@@ -189,7 +201,7 @@ class GPT(nn.Module):
         B, T = idx.shape
         tok = self.token_embedding(idx)                              # (B, T, n_embd)
         pos = self.position_embedding(torch.arange(T, device=idx.device))  # (T, n_embd)
-        x = tok + pos                                                # broadcast add
+        x = self.drop(tok + pos)                                     # broadcast add + dropout
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)                                     # (B, T, vocab_size)
@@ -207,6 +219,7 @@ class GPT(nn.Module):
 
 if __name__ == "__main__":
     # ---- Phase 2 sanity checks: the attention mechanism ----
+    # (dropout defaults to 0.0 here, so these stay deterministic)
     torch.manual_seed(0)
     B, T, C, n_head = 4, 8, 32, 4
     x = torch.randn(B, T, C)
