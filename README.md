@@ -1,6 +1,6 @@
 # nair-gpt
 
-A decoder-only transformer (a tiny GPT) built from scratch in PyTorch, and
+A decoder-only transformer  built from scratch in PyTorch, and
 trained as a character-level language model that generates text one character at
 a time. Multi-head self-attention, causal masking, and positional embeddings are
 all implemented by hand.
@@ -18,7 +18,7 @@ characters -> token embedding + positional embedding
 
 ## Results
 
-Trained the `big` preset on TinyShakespeare (1.1M characters, 65-character vocab)
+Trained  on TinyShakespeare (1.1M characters, 65-character vocab)
 on an Apple M-series GPU (MPS).
 
 - **Parameters:** 10.8M (10,788,929)
@@ -32,7 +32,7 @@ on an Apple M-series GPU (MPS).
 
 
 
-### Generation over training (gibberish → text)
+### Generation over training 
 
 Sampled with the same random seed at each checkpoint, so this is *pure model
 improvement*, not luck of the draw:
@@ -74,7 +74,7 @@ Real character names, `NAME:` speaker labels, line breaks, and verse rhythm all
 emerge. The text is structurally Shakespeare, semantically dreamlike — about what
 a 10.8M-parameter character model reaches on ~1M characters.
 
-## Run it yourself
+## Run it on your local laptop
 
 ```bash
 python3 -m venv .venv
